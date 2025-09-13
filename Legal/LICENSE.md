@@ -17,11 +17,12 @@ _Copyright (c) 2025 Afonso Ribeiro_
     otherwise. If you or your affiliates assert any patent claim against any party alleging
     that the Software infringes a patent, your rights under this license terminate immediately.
 
-5.  **Third-Party Materials.** Some components and outputs are provided under third-party terms
-    (e.g., FreeSurfer). Those terms govern those components.
+5.  **Third-Party Materials.** Some components and outputs are provided under third-party terms.
+    Those terms govern those components.
 
 6.  **Attribution.** Publications or presentations using the Software must cite:
-    (TODO).
+    Ribeiro, A. Diagnostic categories emerge as probability fields in a psychometric continuum.
+    doi: 10.5281/zenodo.17114655.
 
 7.  **Warranty Disclaimer.** THE SOFTWARE IS PROVIDED “AS IS” WITHOUT WARRANTY OF ANY KIND.
     NO IMPLIED WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE, OR
@@ -33,7 +34,7 @@ _Copyright (c) 2025 Afonso Ribeiro_
     OR RELATED TO THE SOFTWARE OR THIS LICENSE, HOWEVER CAUSED, EVEN IF ADVISED OF THE POSSIBILITY
     OF SUCH DAMAGES.
 
-9.	 **Termination.** Any breach of this License terminates it automatically. Upon termination, you must
+9.  **Termination.** Any breach of this License terminates it automatically. Upon termination, you must
     cease all use and distribution of the Software and destroy copies in your possession.
 
 10. **Governing Law and Forum.** This License is governed by the laws of Portugal (including the
