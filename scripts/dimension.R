@@ -271,41 +271,41 @@ nzv <- vapply(X, function(v){
 X <- as.data.frame(X[, nzv, drop = FALSE])
 
 ids <- ids_all[keep]
-rn <- make.unique(ids)
+rn  <- make.unique(ids)
 rownames(X) <- rn
+
+# Map row_id (unique) -> participant_id (original)
+row_to_pid <- stats::setNames(ids, rn)
 
 # Flat ID table for joins
 psy_ids <- tibble::tibble(participant_id = as.character(df[[id_col]]))
 
-# Load diagnoses (long) and build wide 0/1 table
-diag_long_raw <- readr::read_delim("long_diagnoses.csv", delim = ";",
+# Load diagnoses (wide 0/1) and align
+diag_wide_raw <- readr::read_delim("wide_diagnoses.csv", delim = ";",
                                    col_types = readr::cols())
 
-dx_col <- if ("diagnosis" %in% names(diag_long_raw)) "diagnosis" else "Data"
+diag_wide_raw <- diag_wide_raw |>
+  dplyr::mutate(participant_id = as.character(participant_id)) |>
+  dplyr::mutate(dplyr::across(-participant_id, ~ {
+    x <- suppressWarnings(as.integer(.))
+    x[is.na(x)] <- 0L
+    pmin(pmax(x, 0L), 1L)
+  }))
 
-diag_wide <- diag_long_raw |>
-  dplyr::transmute(participant_id = as.character(participant_id),
-                   dx = .data[[dx_col]]) |>
-  dplyr::mutate(present = 1L) |>
-  dplyr::distinct(participant_id, dx, .keep_all = TRUE) |>
-  tidyr::pivot_wider(names_from = dx, values_from = present, values_fill = 0L)
+# Keep a copy keyed by participant_id
+diag_wide <- diag_wide_raw
 
-# Subject-aligned wide diagnoses for arbitrary row lists
-dx_wide_for_rows <- function(ids_vec) {
-  tibble::tibble(participant_id = as.character(ids_vec)) %>%
-    dplyr::left_join(diag_wide, by = "participant_id") %>%
-    dplyr::mutate(dplyr::across(-participant_id, ~ tidyr::replace_na(., 0L)))
-}
-
-# Primary diagnosis label per subject for quick grouping visuals
+# Flat ID table for joins (already built above as psy_ids)
 diag_wide_full <- tibble::tibble(participant_id = as.character(df[[id_col]])) %>%
   dplyr::left_join(diag_wide, by = "participant_id") %>%
   dplyr::mutate(dplyr::across(-participant_id, ~ tidyr::replace_na(., 0L)))
 
 dx_cols_all <- setdiff(names(diag_wide_full), "participant_id")
 
+# Primary diagnosis label per subject for quick grouping visuals
 if (length(dx_cols_all)) {
-  ord <- dx_cols_all[order(colSums(diag_wide_full[, dx_cols_all, drop = FALSE]), decreasing = TRUE)]
+  ord <- dx_cols_all[order(colSums(diag_wide_full[, dx_cols_all, drop = FALSE]),
+                           decreasing = TRUE)]
   primary_dx <- apply(diag_wide_full[, ord, drop = FALSE], 1, function(r){
     ix <- which(r > 0L)
     if (length(ix)) ord[min(ix)] else NA_character_
@@ -314,8 +314,21 @@ if (length(dx_cols_all)) {
   primary_dx <- rep(NA_character_, nrow(diag_wide_full))
 }
 
+# Subject-aligned wide diagnoses for arbitrary row lists
+dx_wide_for_rows <- function(row_ids) {
+  pid <- if (!exists("row_to_pid", inherits = TRUE)) row_ids else {
+    m <- row_to_pid[row_ids]; ifelse(is.na(m), row_ids, m)
+  }
+  tibble::tibble(participant_id = as.character(pid)) %>%
+    dplyr::left_join(diag_wide, by = "participant_id") %>%
+    dplyr::mutate(dplyr::across(-participant_id, ~ tidyr::replace_na(., 0L)))
+}
+
 dx_for_rows <- function(row_ids){
-  mm <- match(row_ids, diag_wide_full$participant_id)
+  pid <- if (!exists("row_to_pid", inherits = TRUE)) row_ids else {
+    m <- row_to_pid[row_ids]; ifelse(is.na(m), row_ids, m)
+  }
+  mm <- match(pid, diag_wide_full$participant_id)
   factor(primary_dx[mm], exclude = NULL)
 }
 
@@ -742,20 +755,37 @@ if (DO_SURFACE) {
   }
   
   # 7) Optional association directly in (u,v) (diagnosis factor)
-  dx_lab <- dx_for_rows(rownames(Yle))
+  dx_lab   <- dx_for_rows(rownames(Yle))
   keep_dx2 <- !is.na(dx_lab)
-  if (any(keep_dx2)) {
-    D_uv <- stats::dist(uv_coords[keep_dx2, , drop = FALSE])
-    df   <- data.frame(dx = droplevels(dx_lab[keep_dx2]))
-    print(vegan::adonis2(D_uv ~ dx, data = df, permutations = 999))
-    
-    # quick categorical association via Cramer's V after clustering (k=4 PAM)
-    set.seed(1) #reproductibility
-    pamk <- cluster::pam(uv_coords[keep_dx2, , drop = FALSE], k = 4)
-    tab_uv <- table(pamk$clustering, droplevels(dx_lab[keep_dx2]))
-    chi2 <- suppressWarnings(chisq.test(tab_uv, correct = FALSE)$statistic)
-    n <- sum(tab_uv); mdf <- min(nrow(tab_uv) - 1, ncol(tab_uv) - 1)
-    cv <- as.numeric(sqrt(chi2 / (n * mdf)))
+  
+  dx_fac <- droplevels(factor(dx_lab[keep_dx2]))
+  n_per_level <- sort(table(dx_fac), decreasing = TRUE)
+  
+  if (length(dx_fac) < 2L || nlevels(dx_fac) < 2L) {
+    message(sprintf("[adonis2] Skipped: need ≥2 levels; got %d level(s) in %d rows.",
+                    nlevels(dx_fac), length(dx_fac)))
+  } else {
+    ok_levels <- names(n_per_level)[n_per_level >= MIN_N_DX]
+    if (length(ok_levels) < 2L) {
+      message(sprintf("[adonis2] Skipped: fewer than two levels meet MIN_N_DX = %d. Level counts: %s",
+                      MIN_N_DX, paste(sprintf("%s=%d", names(n_per_level), n_per_level), collapse = ", ")))
+    } else {
+      sel  <- dx_fac %in% ok_levels
+      dx2  <- droplevels(dx_fac[sel])
+      D_uv <- stats::dist(uv_coords[keep_dx2, , drop = FALSE][sel, , drop = FALSE])
+      df2  <- data.frame(dx = dx2)
+      print(vegan::adonis2(D_uv ~ dx, data = df2, permutations = 999))
+    }
+  }
+  
+  # Optional Cramer's V (also guarded)
+  if (nlevels(dx_fac) >= 2L) {
+    set.seed(1)
+    pamk   <- cluster::pam(uv_coords[keep_dx2, , drop = FALSE], k = 4)
+    tab_uv <- table(pamk$clustering, dx_fac)
+    chi2   <- suppressWarnings(chisq.test(tab_uv, correct = FALSE)$statistic)
+    n      <- sum(tab_uv); mdf <- min(nrow(tab_uv) - 1L, ncol(tab_uv) - 1L)
+    cv     <- as.numeric(sqrt(chi2 / (n * mdf)))
     cat(sprintf("Cramer's V on (u,v) binned: %.3f\n", cv))
   }
 }

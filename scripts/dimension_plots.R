@@ -1,4 +1,4 @@
-# dimension_maps.R — clean, modular rewrite (v1)
+# dimension_plots.R
 # -----------------------------------------------------------------------------
 # Purpose: End-to-end generation of probability fields and diagnostics over a
 # 2D base manifold (b1,b2) and its whitened unit-disk transform (u1,u2).
@@ -11,7 +11,8 @@ suppressPackageStartupMessages({
   library(ggplot2); library(dplyr); library(tidyr)
   library(mgcv);    library(ggrepel); library(readr)
   library(parallelly); library(future); library(future.apply)
-  library(pROC);   library(PRROC); library(progressr)
+  library(pROC);   library(PRROC); library(progressr);
+  library(robustbase)
 })
 
 # ============================== 0) Config =====================================
@@ -26,7 +27,7 @@ default_cfg <- function(){
     # modelling
     dx_min_pos = 10L,
     dx_min_neg = 10L,
-    cv_folds   = 10L,
+    cv_folds   = 5L,
     seed_pred  = 42L,
     
     # significance (clusters)
@@ -58,61 +59,66 @@ log_msg <- function(..., .cfg){ if (isTRUE(.cfg$verbose)) message(sprintf(...)) 
 
 # ---- Safe plan setter ---------------------------------------------------------
 set_future_plan <- function(cfg){
-  # Keep warnings on during dev to catch RNG misuse
-  options(future.rng.onMisuse = "warn")
-  options(future.globals.maxSize = 1024^3)
+  options(future.rng.onMisuse = "warn",
+          future.globals.maxSize = 1024^3)
   if (!isTRUE(cfg$ncores > 1)) {
-    future::plan(future::sequential)
-    return(invisible())
+    future::plan(future::sequential); return(invisible())
   }
-  # Try multisession; if it fails, fall back to sequential
   ok <- try({
-    if (isTRUE(future::supportsMultisession())) {
-      future::plan(future::multisession, workers = cfg$ncores)
+    # Prefer multicore on POSIX if allowed; else multisession
+    if (.Platform$OS.type != "windows" && parallelly::supportsMulticore()) {
+      future::plan(future::multicore, workers = cfg$ncores)
     } else {
-      future::plan(future::sequential)
+      future::plan(future::multisession, workers = cfg$ncores)
     }
   }, silent = TRUE)
   if (inherits(ok, "try-error")) {
-    message("[future] Multisession failed; falling back to sequential (",
+    message("[future] parallel plan failed; falling back to sequential (",
             conditionMessage(attr(ok, "condition")), ")")
     future::plan(future::sequential)
   }
 }
 
 # ---- Robust apply shims (future -> base fallback) -----------------------------
+.drop_future_args <- function(dots){
+  if (is.null(names(dots))) return(dots)
+  dots[!grepl("^future\\.", names(dots), perl = TRUE)]
+}
+
 FUTURE_LAPPLY <- function(X, FUN, ...) {
-  tryCatch(
-    future.apply::future_lapply(X, FUN, ...),
-    error = function(e) {
-      message("[parallel] future_lapply failed, falling back to lapply: ", conditionMessage(e))
-      traceback()  # temporary: see where it breaks
-      base::lapply(X, FUN, ...)
-    }
-  )
+  dots <- list(...)
+  # try future path
+  ok <- try(do.call(future.apply::future_lapply, c(list(X, FUN), dots)), silent = TRUE)
+  if (!inherits(ok, "try-error")) return(ok)
+  message("[parallel] future_lapply failed, falling back to lapply: ",
+          conditionMessage(attr(ok, "condition")))
+  # strip future.* before calling base lapply
+  dots2 <- .drop_future_args(dots)
+  do.call(base::lapply, c(list(X, FUN), dots2))
 }
 
 FUTURE_SAPPLY <- function(X, FUN, ..., simplify = TRUE, USE.NAMES = TRUE) {
-  tryCatch(
-    future.apply::future_sapply(X, FUN, ..., simplify = simplify, USE.NAMES = USE.NAMES),
-    error = function(e) {
-      message("[parallel] future_sapply failed, falling back to sapply: ", conditionMessage(e))
-      traceback()  # temporary: see where it breaks
-      base::sapply(X, FUN, ..., simplify = simplify, USE.NAMES = USE.NAMES)
-    }
-  )
+  dots <- list(...)
+  ok <- try(do.call(future.apply::future_sapply,
+                    c(list(X, FUN, simplify = simplify, USE.NAMES = USE.NAMES), dots)),
+            silent = TRUE)
+  if (!inherits(ok, "try-error")) return(ok)
+  message("[parallel] future_sapply failed, falling back to sapply: ",
+          conditionMessage(attr(ok, "condition")))
+  dots2 <- .drop_future_args(dots)
+  do.call(base::sapply, c(list(X, FUN, simplify = simplify, USE.NAMES = USE.NAMES), dots2))
 }
 
 FUTURE_MAPPLY <- function(FUN, ..., MoreArgs = NULL, SIMPLIFY = TRUE, USE.NAMES = TRUE) {
-  tryCatch(
-    future.apply::future_mapply(FUN, ..., MoreArgs = MoreArgs,
-                                SIMPLIFY = SIMPLIFY, USE.NAMES = USE.NAMES),
-    error = function(e) {
-      message("[parallel] future_mapply failed, falling back to mapply: ", conditionMessage(e))
-      traceback()  # temporary: see where it breaks
-      base::mapply(FUN, ..., MoreArgs = MoreArgs, SIMPLIFY = SIMPLIFY, USE.NAMES = USE.NAMES)
-    }
-  )
+  dots <- list(...)
+  ok <- try(do.call(future.apply::future_mapply,
+                    c(list(FUN, ..., MoreArgs = MoreArgs, SIMPLIFY = SIMPLIFY, USE.NAMES = USE.NAMES), dots)),
+            silent = TRUE)
+  if (!inherits(ok, "try-error")) return(ok)
+  message("[parallel] future_mapply failed, falling back to mapply: ",
+          conditionMessage(attr(ok, "condition")))
+  dots2 <- .drop_future_args(dots)
+  do.call(base::mapply, c(list(FUN, ..., MoreArgs = MoreArgs, SIMPLIFY = SIMPLIFY, USE.NAMES = USE.NAMES), dots2))
 }
 
 # unify ggsave with ragg + mm sizes
@@ -142,6 +148,46 @@ theme_pub <- function(base_size = 11, base_family = "sans"){
       legend.title     = element_text(size = base_size),
       legend.text      = element_text(size = base_size - 1)
     )
+}
+
+scale_prob_fill <- function(cfg){
+  lims <- c(0,1)
+  lab  <- scales::percent_format(accuracy = 1)
+  eng  <- tolower(cfg$palette$engine %||% "scico")
+  dir  <- cfg$palette$direction %||% 1
+  nm   <- cfg$palette$name %||% "lajolla"
+  if (eng == "scico" && requireNamespace("scico", quietly = TRUE)) {
+    scico::scale_fill_scico(palette = nm, direction = dir, limits = lims, na.value = NA, labels = lab)
+  } else if (eng == "colorspace" && requireNamespace("colorspace", quietly = TRUE)) {
+    colorspace::scale_fill_continuous_sequential(palette = nm, rev = (dir == -1), limits = lims, na.value = NA, labels = lab)
+  } else if (eng == "brewer") { # ColorBrewer (via distiller → continuous)
+    ggplot2::scale_fill_distiller(palette = nm, type = "seq", direction = if (dir==1) 1 else -1,
+                                  limits = lims, na.value = NA, labels = lab)
+  } else if (eng == "paletteer" && requireNamespace("paletteer", quietly = TRUE)) {
+    paletteer::scale_fill_paletteer_c(nm, limits = lims, na.value = NA, labels = lab, direction = dir)
+  } else if (eng == "manual" && !is.null(cfg$palette$colours)) {
+    ggplot2::scale_fill_gradientn(colours = cfg$palette$colours, limits = lims, na.value = NA, labels = lab)
+  } else {
+    ggplot2::scale_fill_gradient(low = "#f7fbff", high = "#08306b", limits = lims, na.value = NA, labels = lab)
+  }
+}
+
+# (Only used in fig2 density colouring)
+scale_level_colour <- function(cfg){
+  eng <- tolower(cfg$palette$engine %||% "scico")
+  dir <- cfg$palette$direction %||% 1
+  nm  <- cfg$palette$name %||% "oslo"
+  if (eng == "scico" && requireNamespace("scico", quietly = TRUE)) {
+    scico::scale_colour_scico(palette = nm, direction = dir, guide = "none")
+  } else if (eng == "colorspace" && requireNamespace("colorspace", quietly = TRUE)) {
+    colorspace::scale_colour_continuous_sequential(palette = nm, rev = (dir == -1), guide = "none")
+  } else if (eng == "brewer") {
+    ggplot2::scale_colour_distiller(palette = nm, type = "seq", direction = if (dir==1) 1 else -1, guide = "none")
+  } else if (eng == "paletteer" && requireNamespace("paletteer", quietly = TRUE)) {
+    paletteer::scale_colour_paletteer_c(nm, direction = dir, guide = "none")
+  } else {
+    ggplot2::scale_colour_gradient(guide = "none")
+  }
 }
 
 trim_gam_safe <- function(fit, keep_model = TRUE){
@@ -267,18 +313,94 @@ encode_Z <- function(Base, X_pred, Z = NULL, w_all = NULL){
 
 # ============================ 2) Geometry =====================================
 
-standardise_to_circle <- function(Base2, cover = 0.995){
-  X <- as.matrix(Base2[,1:2,drop=FALSE]); storage.mode(X) <- "double"
-  for (j in 1:2) if (any(!is.finite(X[,j]))){ m <- mean(X[,j], na.rm=TRUE); if (!is.finite(m)) m <- 0; X[!is.finite(X[,j]),j] <- m }
-  mu <- colMeans(X); S <- stats::cov(X); if (!all(is.finite(S)) || det(S)<=0) S <- S + diag(1e-8,2)
-  eig <- eigen(S, symmetric=TRUE); V <- eig$vectors; L <- pmax(eig$values, 1e-12)
-  S_half <- V %*% diag(sqrt(L),2) %*% t(V)
-  S_hi   <- V %*% diag(1/sqrt(L),2) %*% t(V)
-  U0 <- t(S_hi %*% t(sweep(X,2,mu,"-"))); r <- sqrt(rowSums(U0^2))
-  s <- as.numeric(stats::quantile(r, probs = cover, na.rm = TRUE)); if (!is.finite(s) || s<=0) s <- max(r, na.rm=TRUE)
-  fwd <- function(xb1, xb2){ Uq <- t(S_hi %*% t(sweep(cbind(xb1,xb2),2,mu,"-")))/s; colnames(Uq) <- c("u1","u2"); Uq }
-  inv <- function(u1,u2){ Xq <- t(S_half %*% t(cbind(u1,u2)*s)) + matrix(mu, length(u1), 2, byrow=TRUE); colnames(Xq) <- c("b1","b2"); Xq }
-  list(mu=mu, S_half=S_half, S_half_inv=S_hi, s=s, fwd=fwd, inv=inv)
+# Robust whitening to unit disk
+# Robust whitening with trimming + shrinkage
+standardise_to_circle <- function(Base2,
+                                  cover     = 0.98,  # map this inlier-quantile radius to 1
+                                  h_frac    = 0.80,  # central fraction used for shape
+                                  shrink    = 0.15,  # shrinkage to identity (0–0.5 is sane)
+                                  ridge     = 1e-6   # tiny PD floor
+){
+  X <- as.matrix(Base2[, 1:2, drop = FALSE])
+  storage.mode(X) <- "double"
+  # clean NAs per column
+  for (j in 1:2) {
+    v <- suppressWarnings(as.numeric(X[, j]))
+    m <- stats::median(v, na.rm = TRUE)
+    if (!is.finite(m)) m <- 0
+    v[!is.finite(v)] <- m
+    X[, j] <- v
+  }
+  n <- nrow(X); h <- max(ceiling(h_frac * n), 3L)
+  
+  # ---- robust centre + provisional scatter for distances ---------------------
+  have_mcd <- requireNamespace("robustbase", quietly = TRUE)
+  have_trob <- requireNamespace("MASS", quietly = TRUE)
+  
+  if (have_mcd) {
+    cm <- robustbase::covMcd(X, alpha = h_frac)
+    mu0 <- as.numeric(cm$center)
+    S0  <- cm$cov
+  } else if (have_trob) {
+    ct <- MASS::cov.trob(X)
+    mu0 <- as.numeric(ct$center)
+    S0  <- ct$cov
+  } else {
+    mu0 <- apply(X, 2, stats::median)
+    mad2 <- stats::mad(X[,1], constant = 1.4826)^2 + ridge
+    mad2b<- stats::mad(X[,2], constant = 1.4826)^2 + ridge
+    S0   <- diag(c(mad2, mad2b), 2)
+  }
+  
+  # stabilise S0
+  if (!all(is.finite(S0))) S0[] <- 0
+  e0 <- eigen(S0, symmetric = TRUE)
+  lam0 <- pmax(e0$values, ridge)
+  V0   <- e0$vectors
+  S0_inv <- V0 %*% diag(1/lam0, 2) %*% t(V0)
+  
+  # robust distances; keep central h for shape
+  D2 <- rowSums((X - matrix(mu0, n, 2, byrow = TRUE)) %*% S0_inv * (X - matrix(mu0, n, 2, byrow = TRUE)))
+  idx <- order(D2, na.last = NA)[seq_len(min(h, length(D2)))]
+  
+  Xin <- X[idx, , drop = FALSE]
+  mu  <- colMeans(Xin)
+  
+  # classical cov on inliers, then shrink toward identity (trace/2)
+  Sin <- stats::cov(Xin)
+  if (!all(is.finite(Sin))) Sin <- diag(1, 2)
+  
+  tr  <- sum(diag(Sin))
+  tau <- if (is.finite(tr) && tr > 0) tr/2 else 1
+  Ssh <- (1 - shrink) * Sin + shrink * (tau * diag(2))
+  Ssh <- Ssh + ridge * tau * diag(2)
+  
+  # eigendecompose; build whitening and its inverse
+  e  <- eigen(Ssh, symmetric = TRUE)
+  lam <- pmax(e$values, ridge)
+  V   <- e$vectors
+  S_half <- V %*% diag(sqrt(lam), 2) %*% t(V)
+  S_hi   <- V %*% diag(1/sqrt(lam), 2) %*% t(V)
+  
+  # whiten all points
+  U0 <- t(S_hi %*% t(sweep(X, 2, mu, "-")))
+  r  <- sqrt(rowSums(U0^2))
+  
+  # scale by inlier radius quantile (measured on inliers)
+  rin <- sqrt(rowSums( (t(S_hi %*% t(sweep(Xin, 2, mu, "-"))))^2 ))
+  s   <- as.numeric(stats::quantile(rin, probs = cover, na.rm = TRUE))
+  if (!is.finite(s) || s <= 0) s <- max(rin, na.rm = TRUE)
+  
+  fwd <- function(xb1, xb2){
+    Uq <- t(S_hi %*% t(sweep(cbind(xb1, xb2), 2, mu, "-"))) / s
+    colnames(Uq) <- c("u1","u2"); Uq
+  }
+  inv <- function(u1, u2){
+    Xq <- t(S_half %*% t(cbind(u1, u2) * s)) + matrix(mu, length(u1), 2, byrow = TRUE)
+    colnames(Xq) <- c("b1","b2"); Xq
+  }
+  
+  list(mu = mu, S_half = S_half, S_half_inv = S_hi, s = s, fwd = fwd, inv = inv)
 }
 
 make_unitdisk_square <- function(nu){
@@ -396,7 +518,7 @@ auprc_point <- function(y, p){
   n <- length(y); P <- sum(y); N <- n - P
   if (n < 2L || P == 0L || N == 0L) return(NA_real_)
   if (requireNamespace("PRROC", quietly = TRUE)) {
-    r <- try(PRROC::pr.curve(scores.class0 = p[y==0], scores.class1 = p[y==1], curve = FALSE), silent = TRUE)
+    r <- try(PRROC::pr.curve(scores.class0 = p[y==1], scores.class1 = p[y==0], curve = FALSE), silent = TRUE)
     if (!inherits(r, "try-error")) {
       ap <- as.numeric(r$auc.integral)
       if (is.finite(ap)) return(ap)
@@ -497,28 +619,66 @@ boot_ci <- function(y, p, FUN, B = 1000L, seed = 42L){
   )
 }
 
+# helper: robust equal-count binning for calibration
+make_calib_bins <- function(pc, n_min = 10L, max_bins = 8L) {
+  # pc must be numeric in [0,1]
+  pc <- as.numeric(pc)
+  pc <- pmin(pmax(pc, 1e-12), 1 - 1e-12)
+  
+  # deterministic tie-break so pj is strictly increasing on ties
+  rk <- rank(pc, ties.method = "first")
+  pj <- pc + 1e-12 * rk
+  
+  n <- length(pj)
+  k_target <- max(2L, min(max_bins, floor(n / max(n_min, 1L))))
+  
+  # primary breaks
+  br <- unique(stats::quantile(pj, probs = seq(0, 1, length.out = k_target + 1L),
+                               type = 7, na.rm = TRUE))
+  
+  # last-ditch fallback to 2 bins if quantiles collapse
+  if (length(br) < 3L) {
+    br <- unique(stats::quantile(pj, probs = c(0, .5, 1),
+                                 type = 7, na.rm = TRUE))
+  }
+  
+  # if still not enough distinct breaks, return a 2-level logical split
+  if (length(br) < 2L) {
+    g <- rk > stats::median(rk, na.rm = TRUE)
+    return(list(g = as.factor(g), n_bins = length(unique(g[is.finite(g)]))))
+  }
+  
+  g <- cut(pj, breaks = br, include.lowest = TRUE, right = TRUE)
+  
+  # if cut() produced <2 effective groups (can happen with severe ties), logical split fallback
+  if (length(levels(g)) < 2L || length(unique(g[!is.na(g)])) < 2L) {
+    g <- rk > stats::median(rk, na.rm = TRUE)
+    g <- as.factor(g)
+  }
+  list(g = g, n_bins = length(levels(g)))
+}
+
 # ---- Simple, dependency-free AECE with robust binning ------------------------
 # Uses calibrated-to-prevalence probabilities (order-preserving), then equal-count quantile bins.
 robust_aece <- function(y, p, min_bin = 10L, max_bins = 8L){
-  y <- as.integer(y>0); p <- as.numeric(p)
+  y <- as.integer(y > 0); p <- as.numeric(p)
   ok <- is.finite(y) & is.finite(p); y <- y[ok]; p <- p[ok]
   n <- length(y); if (n < 2L) return(list(aece = NA_real_, n_bins = 0L))
+  
   prev <- mean(y)
   
-  # calib-in-the-large: shift on logit scale toward prevalence
+  # calib-in-the-large on logit scale
   pclip <- pmin(pmax(p, 1e-6), 1 - 1e-6)
   lp <- qlogis(pclip); adj <- qlogis(prev) - mean(lp)
   pc <- plogis(lp + adj)
   
-  # tiny jitter on ranks to stabilise cuts without changing order
-  rk <- rank(pc, ties.method = "average")
-  pj <- pc + 1e-12 * rk
+  # flat after calibration? aECE is zero with 1 bin
+  if (!any(is.finite(pc)) || diff(range(pc, na.rm = TRUE)) < 1e-12) {
+    return(list(aece = 0, n_bins = 1L))
+  }
   
-  k_target <- max(2L, min(max_bins, floor(n / max(min_bin, 1L))))
-  br <- unique(stats::quantile(pj, probs = seq(0, 1, length.out = k_target + 1L), type = 7, na.rm = TRUE))
-  if (length(br) < 3L) br <- unique(stats::quantile(pj, probs = c(0, .5, 1), type = 7, na.rm = TRUE))
-  g <- cut(pj, breaks = br, include.lowest = TRUE, right = TRUE)
-  if (length(levels(g)) < 2L || length(unique(g[!is.na(g)])) < 2L) g <- rk > median(rk, na.rm = TRUE)
+  B <- make_calib_bins(pc, n_min = min_bin, max_bins = max_bins)
+  g <- B$g
   
   T <- data.frame(
     n    = as.integer(tapply(y, g, length)),
@@ -527,8 +687,11 @@ robust_aece <- function(y, p, min_bin = 10L, max_bins = 8L){
   )
   T <- T[is.finite(T$n) & T$n > 0, , drop = FALSE]
   if (!nrow(T)) return(list(aece = NA_real_, n_bins = 0L))
-  list(aece = as.numeric(weighted.mean(abs(T$phat - T$ybar), w = T$n)),
-       n_bins = as.integer(nrow(T)))
+  
+  list(
+    aece   = as.numeric(weighted.mean(abs(T$phat - T$ybar), w = T$n)),
+    n_bins = as.integer(nrow(T))
+  )
 }
 
 # ---- Brier score + Brier R^2 (skill) -----------------------------------------
@@ -569,7 +732,7 @@ boot_brier_R2 <- function(y, p, B = 1000L, seed = 42L){
       as.numeric(brier_R2(y[ii], p[ii]))
     },
     y = y, p = p, i0 = i0, i1 = i1,
-    future.seed = TRUE, future.globals = FALSE
+    future.seed = TRUE, future.globals = TRUE
   )
   vf <- vals[is.finite(vals)]
   if (!length(vf)) return(c(point = pt, lo = NA_real_, hi = NA_real_))
@@ -752,7 +915,7 @@ fit_dx_gams <- function(DxW_A, Base_A, dx_keep, cfg){
     B1    = as.numeric(B1),
     B2    = as.numeric(B2),
     future.seed    = TRUE,
-    future.globals = FALSE
+    future.globals = TRUE
   )
   
   fits <- lapply(res, `[[`, "fit"); names(fits) <- dx_keep
@@ -789,7 +952,7 @@ predict_dx_fields <- function(fits_dx, dx_prev, geom, cfg){
       },
       gridX_sq = geom$gridX_sq, mask_sq = geom$mask_sq,
       method = cfg$sig_method, B = cfg$sig_B, fwer = cfg$sig_fwer,
-      future.seed = TRUE, future.globals = FALSE
+      future.seed = TRUE, future.globals = TRUE
     )
     THR <- dplyr::bind_rows(THR_LIST)
     p("thr")
@@ -826,7 +989,7 @@ predict_dx_fields <- function(fits_dx, dx_prev, geom, cfg){
           )
         },
         gridX_sq = geom$gridX_sq, mask_sq = geom$mask_sq, UD = geom$UD, thr_of = thr_of,
-        future.seed = TRUE, future.globals = FALSE
+        future.seed = TRUE, future.globals = TRUE
       )
     )
     p("Fstd")
@@ -870,7 +1033,7 @@ predict_dx_fields <- function(fits_dx, dx_prev, geom, cfg){
           )
         },
         gridB_full = geom$gridB_full, mask_hull = geom$mask_hull, thr_of = thr_of,
-        future.seed = TRUE, future.globals = FALSE
+        future.seed = TRUE, future.globals = TRUE
       )
     )
     p("Fbase")
@@ -899,7 +1062,7 @@ predict_dx_fields <- function(fits_dx, dx_prev, geom, cfg){
           )
         },
         gridX_sq = geom$gridX_sq, UD = geom$UD, thr_of = thr_of,
-        future.seed = TRUE, future.globals = FALSE
+        future.seed = TRUE, future.globals = TRUE
       )
     )
     p("Fsq")
@@ -924,7 +1087,7 @@ predict_dx_fields <- function(fits_dx, dx_prev, geom, cfg){
           )
         },
         gridX_sq = geom$gridX_sq, UD = geom$UD, mask_sq = geom$mask_sq, thr_of = thr_of,
-        future.seed = TRUE, future.globals = FALSE
+        future.seed = TRUE, future.globals = TRUE
       )
     )
     p("Fsig")
@@ -967,7 +1130,7 @@ plots_for_dx <- function(fields, geom, cfg){
                shape = 20, size = 0.30, colour = scales::alpha("black", 0.45), alpha = 1) +
     coord_equal(xlim = c(-1,1), ylim = c(-1,1), expand = FALSE) +
     facet_wrap(~ dx, ncol = 4, scales = "fixed") +
-    scale_fill_viridis_c(limits = c(0,1), labels = scales::percent_format(accuracy = 1), na.value = NA) +
+    scale_prob_fill(cfg) +
     labs(x = "u1 (whitened b1,b2)", y = "u2", fill = "Pr(dx)") + theme_pub(11)
   
   p_base <- ggplot(fields$Fbase, aes(b1, b2)) +
@@ -978,7 +1141,7 @@ plots_for_dx <- function(fields, geom, cfg){
     geom_contour(aes(z = z, linetype = after_stat(ifelse(..level.. < 0, "neg", "pos"))),
                  breaks = c(-2, 2), colour = "black", linewidth = 0.35, alpha = .9, na.rm = TRUE) +
     scale_linetype_manual(values = c(neg = "dashed", pos = "solid"), guide = "none") +
-    scale_fill_viridis_c(limits = c(0,1), labels = scales::percent_format(accuracy = 1), na.value = NA) +
+    scale_prob_fill(cfg) + 
     coord_equal() + facet_wrap(~ dx, ncol = 4, scales = "fixed") +
     labs(x = "b1", y = "b2", fill = "Pr(dx)") + theme_pub(11)
   
@@ -992,7 +1155,7 @@ plots_for_dx <- function(fields, geom, cfg){
                shape = 20, size = 0.30, colour = scales::alpha("black", 0.45), alpha = 1) +
     coord_equal(xlim = c(-1,1), ylim = c(-1,1), expand = FALSE) +
     facet_wrap(~ dx, ncol = 4, scales = "fixed") +
-    scale_fill_viridis_c(limits = c(0,1), labels = scales::percent_format(accuracy = 1), na.value = NA) +
+    scale_prob_fill(cfg) +
     labs(x = "u1 (whitened b1,b2)", y = "u2", fill = "Pr(dx)") + theme_pub(11)
   
   list(p_std = p_std, p_base = p_base, p_sq = p_sq)
@@ -1163,7 +1326,7 @@ predict_cluster_fields <- function(fits_cl, cl_prev, cl_vec, geom, cfg){
         data.frame(cluster = sh$id, u1 = UD$grid$u1, u2 = UD$grid$u2, p = p)
       },
       gridX_sq = geom$gridX_sq, mask_sq = geom$mask_sq, UD = geom$UD,
-      future.seed = TRUE, future.globals = FALSE
+      future.seed = TRUE, future.globals = TRUE
     )
   )
   Fstd$cluster <- factor(Fstd$cluster, levels = labs)
@@ -1182,7 +1345,7 @@ predict_cluster_fields <- function(fits_cl, cl_prev, cl_vec, geom, cfg){
                    p = pmin(pmax(p_hat,1e-6),1-1e-6), z = z_p)
       },
       gridB_full = geom$gridB_full, mask_hull = geom$mask_hull,
-      future.seed = TRUE, future.globals = FALSE
+      future.seed = TRUE, future.globals = TRUE
     )
   )
   Fbase$cluster <- factor(Fbase$cluster, levels = labs)
@@ -1196,7 +1359,7 @@ predict_cluster_fields <- function(fits_cl, cl_prev, cl_vec, geom, cfg){
                    p = pmin(pmax(p,1e-6),1-1e-6))
       },
       gridX_sq = geom$gridX_sq, UD = geom$UD,
-      future.seed = TRUE, future.globals = FALSE
+      future.seed = TRUE, future.globals = TRUE
     )
   )
   Fsq$cluster <- factor(Fsq$cluster, levels = labs)
@@ -1227,7 +1390,7 @@ predict_cluster_fields <- function(fits_cl, cl_prev, cl_vec, geom, cfg){
     },
     gridX_sq = geom$gridX_sq, mask_sq = geom$mask_sq,
     method = cfg$sig_method, B = cfg$sig_B, fwer = cfg$sig_fwer, UD = geom$UD,
-    future.seed = TRUE, future.globals = FALSE
+    future.seed = TRUE, future.globals = TRUE
   )
   Fsig <- dplyr::bind_rows(sig_list)
   Fsig$cluster <- factor(Fsig$cluster, levels = labs)
@@ -1277,7 +1440,7 @@ plots_for_clusters <- function(CF, geom, cfg, add_hulls = TRUE){
                                        inherit.aes = FALSE, colour = "black", linewidth = 0.45) } +
     coord_equal(xlim = c(-1,1), ylim = c(-1,1), expand = FALSE) +
     facet_wrap(~ cluster, ncol = 4) +
-    scale_fill_viridis_c(limits = c(0,1), labels = scales::percent, na.value = NA) +
+    scale_prob_fill(cfg) +
     labs(x = "u1 (whitened b1,b2)", y = "u2", fill = "Pr(cluster)") + theme_pub(11)
   
   p_base <- ggplot(CF$Fbase, aes(b1, b2)) +
@@ -1288,7 +1451,7 @@ plots_for_clusters <- function(CF, geom, cfg, add_hulls = TRUE){
     geom_contour(aes(z = z, linetype = after_stat(ifelse(..level.. < 0, "neg", "pos"))),
                  breaks = c(-2,2), colour = "black", linewidth = 0.35, alpha = .9, na.rm = TRUE) +
     scale_linetype_manual(values = c(neg="dashed", pos="solid"), guide = "none") +
-    scale_fill_viridis_c(limits = c(0,1), labels = scales::percent, na.value = NA) +
+    scale_prob_fill(cfg) +
     coord_equal() + facet_wrap(~ cluster, ncol = 4) +
     labs(x = "b1", y = "b2", fill = "Pr(cluster)") + theme_pub(11)
   
@@ -1303,7 +1466,7 @@ plots_for_clusters <- function(CF, geom, cfg, add_hulls = TRUE){
                shape = 20, size = 0.30, colour = scales::alpha("black", 0.45), alpha = 1) +
     coord_equal(xlim = c(-1,1), ylim = c(-1,1), expand = FALSE) +
     facet_wrap(~ cluster, ncol = 4) +
-    scale_fill_viridis_c(limits = c(0,1), labels = scales::percent, na.value = NA) +
+    scale_prob_fill(cfg) +
     labs(x = "u1 (whitened b1,b2)", y = "u2", fill = "Pr(cluster)") + theme_pub(11)
   
   list(p_std = p_std, p_base = p_base, p_sq = p_sq)
@@ -1452,7 +1615,9 @@ run_dx_metrics <- function(DxW_A, Base_A, XR = NULL, cfg, out_prefix = ""){
     y <- as.integer(DxW_A[[dx]] > 0)
     if (length(unique(y)) < 2L) next
     
-    K <- max(2L, min(Kdef, floor(sum(y==1)/8), floor(sum(y==0)/8)))
+    K <- max(2L, min(Kdef,
+                     floor(sum(y==1) / Kdef),
+                     floor(sum(y==0) / Kdef)))
     
     # OOF predictions for each variant (Base / Fibre / Both)
     models <- tryCatch(
@@ -1515,7 +1680,7 @@ run_dx_metrics <- function(DxW_A, Base_A, XR = NULL, cfg, out_prefix = ""){
       
       # --- PR curve ---
       if (requireNamespace("PRROC", quietly = TRUE) && any(is.finite(p))){
-        rr <- PRROC::pr.curve(scores.class0 = p[y==0], scores.class1 = p[y==1], curve = TRUE)
+        rr <- PRROC::pr.curve(scores.class0 = p[y==1], scores.class1 = p[y==0], curve = TRUE)
         prdf <- data.frame(recall = rr$curve[,1], precision = rr$curve[,2])
         g_pr <- ggplot(prdf, aes(recall, precision)) +
           geom_path() +
@@ -1573,55 +1738,119 @@ run_dx_metrics <- function(DxW_A, Base_A, XR = NULL, cfg, out_prefix = ""){
   print(Btab)
 }
 
-# Minimal, dependency-light calibration scatter per dx using robust_aece bins.
-# If you have your richer iso/band helpers, slot them in later.
-calibration_plot_dx <- function(DxW_A, Base_A, cfg, XR = NULL){
+# Monotone calibration curve per diagnosis (facetted), with optional bin points
+calibration_curve_dx <- function(DxW_A, Base_A, cfg, XR = NULL,
+                                 show_points = TRUE, band_B = 0L){
   dx_keep <- names(DxW_A)
-  plist <- list()
-  for (dx in dx_keep){
-    y <- as.integer(DxW_A[[dx]] > 0)
-    if (length(unique(y)) < 2L) next
-    K <- max(2L, min(cfg$cv_folds, floor(sum(y==1)/8), floor(sum(y==0)/8)))
-    # Use Base-only OOF for calibration view (keeps it simple)
-    p <- oof_prob(y, Base_A, K = K, seed = cfg$seed_pred)
-    prev <- mean(y)
-    # bins for plotting
+  curves  <- list()
+  ptslist <- list()
+  bands   <- list()
+  set.seed(cfg$seed_pred)
+  
+  # helper: isotonic step coordinates + (optional) bootstrap band
+  .iso_curve <- function(p, y, B = 0L){
     pclip <- pmin(pmax(p, 1e-6), 1 - 1e-6)
-    lp <- qlogis(pclip); adj <- qlogis(prev) - mean(lp)
-    pc <- plogis(lp + adj)
+    lp <- qlogis(pclip)
+    pc <- plogis(lp + (qlogis(mean(y)) - mean(lp)))  # calib-in-the-large
+    if (!any(is.finite(pc)) || length(unique(pc[is.finite(pc)])) < 2L) return(NULL)
     
-    rk <- rank(pc, ties.method = "average")
-    pj <- pc + 1e-12 * rk
-    k_target <- max(2L, min(8L, floor(length(y) / max(10L, 1L))))
-    br <- unique(stats::quantile(pj, probs = seq(0,1,length.out = k_target+1L), type=7, na.rm = TRUE))
-    if (length(br) < 3L) br <- unique(stats::quantile(pj, probs = c(0,.5,1), type=7, na.rm = TRUE))
-    g <- cut(pj, breaks = br, include.lowest = TRUE, right = TRUE)
-    if (length(levels(g)) < 2L || length(unique(g[!is.na(g)])) < 2L) g <- rk > median(rk, na.rm = TRUE)
+    o  <- order(pc); xs <- pc[o]; ys <- y[o]
+    iso <- stats::isoreg(xs, ys)                      # monotone on observed x
+    S   <- aggregate(yf ~ x, data.frame(x = iso$x, yf = iso$yf), mean)
     
+    out <- list(step = dplyr::rename(S, p = x, y = yf))  # <- yf exists here
+    
+    if (B > 0L) {
+      xg <- seq(min(xs), max(xs), length.out = 101)      # band only where we have support
+      eval_iso <- function(x, y){
+        o  <- order(x); xi <- x[o]; yi <- y[o]
+        ii <- stats::isoreg(xi, yi)
+        f  <- stats::approxfun(ii$x, ii$yf, method = "constant", f = 1,
+                               yleft = ii$yf[1L], yright = ii$yf[length(ii$yf)])
+        f(xg)
+      }
+      i0 <- which(ys == 0L); i1 <- which(ys == 1L)
+      M  <- replicate(B, {
+        jj <- c(sample(i0, length(i0), TRUE), sample(i1, length(i1), TRUE))
+        eval_iso(xs[jj], ys[jj])
+      })
+      lo <- apply(M, 1, stats::quantile, 0.025, na.rm = TRUE)
+      hi <- apply(M, 1, stats::quantile, 0.975, na.rm = TRUE)
+      out$band <- data.frame(p = xg, y_lo = lo, y_hi = hi)
+    }
+    out
+  }
+  
+  # equal-count bins (to optionally overlay points)
+  .bins_df <- function(pc, y){
+    B <- make_calib_bins(pc, n_min = 10L, max_bins = 8L)
+    g <- B$g
     T <- data.frame(
       n    = as.integer(tapply(y, g, length)),
       ybar = as.numeric(tapply(y, g, mean)),
       phat = as.numeric(tapply(pc, g, mean))
     )
-    T <- T[is.finite(T$n) & T$n > 0, , drop = FALSE]
-    if (!nrow(T)) next
-    
-    plist[[dx]] <- data.frame(dx = dx, n = T$n, y_bar = T$ybar, p_hat = T$phat)
+    T[is.finite(T$n) & T$n > 0, , drop = FALSE]
   }
-  if (!length(plist)) return(NULL)
-  PTS <- dplyr::bind_rows(plist)
-  ggplot(PTS, aes(x = p_hat, y = y_bar, size = n)) +
+  
+  for (dx in dx_keep){
+    y <- as.integer(DxW_A[[dx]] > 0)
+    if (length(unique(y)) < 2L) next
+    
+    K <- max(2L, min(cfg$cv_folds, floor(sum(y==1)/8), floor(sum(y==0)/8)))
+    p <- oof_prob(y, Base_A, K = K, seed = cfg$seed_pred)
+    
+    # calib-in-the-large pc for points overlay
+    pclip <- pmin(pmax(p, 1e-6), 1 - 1e-6)
+    pc <- plogis(qlogis(pclip) + (qlogis(mean(y)) - mean(qlogis(pclip))))
+    
+    ISO <- .iso_curve(p, y, B = band_B)
+    if (is.null(ISO)) next
+    curves[[dx]] <- transform(ISO$step, dx = dx)
+    
+    if (show_points) {
+      T <- .bins_df(pc, y)
+      if (nrow(T)) ptslist[[dx]] <- data.frame(dx = dx, n = T$n, p_hat = T$phat, y_bar = T$ybar)
+    }
+    if (!is.null(ISO$band)) bands[[dx]] <- transform(ISO$band, dx = dx)
+  }
+  
+  if (!length(curves)) return(NULL)
+  CUR <- dplyr::bind_rows(curves)
+  PTS <- if (length(ptslist)) dplyr::bind_rows(ptslist) else NULL
+  BND <- if (length(bands))   dplyr::bind_rows(bands)   else NULL
+  
+  gg <- ggplot() +
     geom_abline(slope = 1, intercept = 0, linetype = 3, linewidth = 0.35, colour = "grey45") +
-    geom_point(shape = 21, stroke = 0.35, fill = "black", colour = "white", alpha = 0.95) +
-    scale_size_continuous(range = c(1.6, 5.2), name = "bin support (n)") +
+    { if (!is.null(BND)) geom_ribbon(data = BND, aes(x = p, ymin = y_lo, ymax = y_hi),
+                                     inherit.aes = FALSE, alpha = 0.18) } +
+    geom_step(data = CUR, aes(x = p, y = y), direction = "vh", linewidth = 0.7) +
+    { if (!is.null(PTS) && show_points)
+      geom_point(data = PTS, aes(x = p_hat, y = y_bar), size = 1.6,
+                 shape = 21, stroke = 0.35, fill = "black", colour = "white", alpha = 0.95,
+                 show.legend = FALSE) } +
     facet_wrap(~ dx, ncol = 4) +
     coord_equal(xlim = c(0,1), ylim = c(0,1), expand = FALSE) +
-    labs(x = "Predicted probability (calib-in-the-large)", y = "Observed frequency") +
+    labs(x = "Predicted probability (calib-in-the-large)",
+         y = "Observed frequency") +
+    geom_rug(data = CUR, aes(x = p), sides = "b", alpha = 0.25, linewidth = 0.2, inherit.aes = FALSE) +
     theme_pub(11) +
-    theme(legend.position = "right")
+    theme(legend.position = if (!is.null(PTS) && show_points) "right" else "none")
+  gg
 }
 
 # ---- 10.1 Neighbour stability under Gaussian noise ---------------------------
+knn_idx <- function(X, k){
+  if (requireNamespace("RANN", quietly = TRUE)) {
+    nn <- RANN::nn2(X, query = X, k = k + 1L)
+    idx <- nn$nn.idx[, -1, drop = FALSE] # drop self
+    return(idx)
+  } else {
+    D <- as.matrix(dist(X)); diag(D) <- Inf
+    t(apply(D, 1, function(d) order(d)[1:k]))
+  }
+}
+
 knn_stability_plot <- function(Base_A, k = 15L,
                                sd_grid = c(0, 0.05, 0.10, 0.15, 0.20),
                                R = 600L, seed = 42L){
@@ -1629,16 +1858,6 @@ knn_stability_plot <- function(Base_A, k = 15L,
   if (is.null(B)) return(NULL)
   storage.mode(B) <- "double"
   
-  knn_idx <- function(X, k){
-    if (requireNamespace("RANN", quietly = TRUE)) {
-      nn <- RANN::nn2(X, query = X, k = k + 1L)
-      idx <- nn$nn.idx[, -1, drop = FALSE] # drop self
-      return(idx)
-    } else {
-      D <- as.matrix(dist(X)); diag(D) <- Inf
-      t(apply(D, 1, function(d) order(d)[1:k]))
-    }
-  }
   jaccard_row <- function(a, b){
     inter <- length(intersect(a, b)); uni <- length(union(a, b))
     if (uni == 0) 1 else inter / uni
@@ -1661,7 +1880,7 @@ knn_stability_plot <- function(Base_A, k = 15L,
           mean_jaccard(N0, N1)
         },
         B = B, k = k,
-        future.seed = TRUE, future.globals = FALSE
+        future.seed = TRUE, future.globals = TRUE
       )
     }
     c(mean = mean(vals),
@@ -1680,6 +1899,46 @@ knn_stability_plot <- function(Base_A, k = 15L,
     labs(x = "Noise σ (Base units)", y = sprintf("Mean Jaccard (k=%d)", k)) +
     theme_pub(12)
   list(data = ST, plot = p)
+}
+
+knn_stability_plot_kband <- function(Base_A,
+                                     k_range = 10:20,
+                                     sd_grid = c(0, 0.05, 0.10, 0.15, 0.20),
+                                     R = 600L, seed = 42L){
+  set.seed(seed)
+  B <- as.matrix(Base_A[, 1:2])
+  if (!is.matrix(B) || ncol(B) != 2) stop("Base_A must have 2 columns")
+  N <- nrow(B)
+  
+  res <- lapply(sd_grid, function(sigma){
+    J_per_point <- replicate(R, {
+      noise <- matrix(rnorm(N * 2, 0, sigma), N, 2)
+      Bp <- B + noise
+      rowMeans(sapply(k_range, function(k){
+        N0 <- knn_idx(B,  k = k)
+        N1 <- knn_idx(Bp, k = k)
+        sapply(seq_len(N), function(i){
+          a <- N0[i,]; b <- N1[i,]
+          inter <- length(intersect(a,b))
+          union <- length(unique(c(a,b)))
+          if (union == 0) 1 else inter/union
+        })
+      }))
+    })
+    rowMeans(J_per_point)
+  })
+  
+  M <- do.call(cbind, res)
+  
+  stats <- apply(M, 2, function(col) c(
+    mean = mean(col),
+    p10  = unname(quantile(col, 0.10, names = FALSE)),
+    p90  = unname(quantile(col, 0.90, names = FALSE))
+  ))
+  stats <- t(stats)
+  colnames(stats) <- c("mean","p10","p90")
+  
+  list(sd = sd_grid, stats = stats, per_point = M)   # ← no extra t()
 }
 
 # ---- 10.2 Co-occurrence lift (upper triangle, diagonal=1) --------------------
@@ -1724,7 +1983,7 @@ lift_map_plot <- function(DxW_A, order = c("original","prevalence","cluster"),
       suppressWarnings(fisher.test(mat)$p.value)
     },
     ij$i, ij$j, MoreArgs = list(M = M),
-    future.seed = TRUE, future.globals = FALSE
+    future.seed = TRUE, future.globals = TRUE
   )
   pv <- if (adjust_p) p.adjust(pv, "BH") else pv
   U$star <- ifelse(is.finite(pv) & pv < .01, "**",
@@ -1765,7 +2024,7 @@ figure2_plots <- function(geom, Fbase_dx, br_fixed){
   U_sq <- subset(geom$U, insq)
   fig2A <- ggplot() +
     stat_density_2d(data = U_sq, aes(u1, u2, colour = after_stat(level)), bins = 6, linewidth = 0.45, alpha = 0.9) +
-    scale_colour_viridis_c(option = "E", guide = "none") +
+    scale_prob_fill(cfg) +
     geom_point(data = U_sq, aes(u1, u2), shape = 16, size = 0.9, colour = scales::alpha("black", 0.35)) +
     annotate("rect", xmin = -1, xmax = 1, ymin = -1, ymax = 1, fill = NA, colour = "black", linewidth = 0.35) +
     coord_equal(xlim = c(-1, 1), ylim = c(-1, 1), expand = FALSE) +
@@ -1809,7 +2068,7 @@ direction_wheel_plot <- function(geom){
   
   G <- expand.grid(u1 = gx, u2 = gy)
   theta <- atan2(G$u2, G$u1); r <- sqrt(G$u1^2 + G$u2^2)
-  H0 <- 210; L0 <- 83; Cmax <- 62; betaC <- 0.85
+  H0 <- -200; L0 <- 60; Cmax <- 90; betaC <- 0.70
   H <- (H0 + theta * 180/pi) %% 360
   C <- pmin(Cmax * (pmin(r, 1)^betaC), Cmax)
   L <- pmax(0, pmin(100, L0 - 6*(pmin(r,1)^1.1)))
@@ -1967,6 +2226,8 @@ base_performance_table <- function(DxW_A, Base_A, cfg, out_prefix = "TAB_"){
   invisible(pretty_tbl)
 }
 
+# ====================== SEQUENTIAL DRIVER (no wrapper) =======================
+
 B_coords <- as.matrix(Base[, 1:2, drop = FALSE])
 colnames(B_coords) <- c("B1","B2")
 
@@ -1976,8 +2237,6 @@ attr(B_coords, "varmap") <- c(B1 = "b1", B2 = "b2")
 # attr(B_coords, "varmap") <- c(B1 = 1L, B2 = 2L)
 
 stopifnot(identical(rownames(B_coords), rownames(Base)))
-
-# ====================== SEQUENTIAL DRIVER (no wrapper) =======================
 
 # 0) Config (use your default_cfg already defined)
 cfg <- default_cfg()
@@ -1990,6 +2249,12 @@ cfg$nu_unit <- 400L
 cfg$n_base_grid <- 140L
 dir.create(cfg$out_dir, showWarnings = FALSE, recursive = TRUE)
 
+cfg$palette <- list(
+  engine    = "scico",   # "scico" | "colorspace" | "brewer" | "paletteer" | "manual"
+  name      = "lapaz", # e.g. scico: "lajolla","batlow","oslo" ; brewer: "YlGnBu"
+  direction = 1,         # 1 or -1 (reverse)
+  colours   = NULL       # only used if engine == "manual"
+)
 
 Sys.setenv(
   OPENBLAS_NUM_THREADS = "1",
@@ -2061,16 +2326,44 @@ artefacts$FIG_biplot_items_UNITDISK <- save_plot("FIG_biplot_items_UNITDISK.png"
 run_dx_metrics(DxW_A, Base_A, XR = E %||% NULL, cfg = cfg, out_prefix = "")
 
 # 8) Calibration panel ---------------------------------------------------------
-p_cal <- calibration_plot_dx(DxW_A, Base_A, cfg, XR = E %||% NULL)
+p_cal <- calibration_curve_dx(DxW_A, Base_A, cfg, XR = E %||% NULL,
+                              show_points = TRUE, band_B = 0L)  # set band_B=200 for a 95% band
 if (inherits(p_cal, "ggplot")) {
   artefacts$FIG_calibration_per_dx <- save_plot("FIG_calibration_per_dx.png", p_cal, 180, 140, cfg)
 }
 
-# 9) KNN stability -------------------------------------------------------------
-KN <- knn_stability_plot(Base_A)
-if (!is.null(KN$plot)) {
-  artefacts$FIG_knn_stability_vs_noise <- save_plot("FIG_knn_stability_vs_noise.png", KN$plot, 130, 95, cfg)
-}
+# 9) KNN stability (k-band): mean line with p10–p90 ribbon ---------------------
+KB <- knn_stability_plot_kband(
+  Base_A,
+  k_range = 10:20,
+  sd_grid = c(0, 0.05, 0.10, 0.15, 0.20),
+  R = 600L,
+  seed = cfg$seed_pred
+)
+
+ST <- data.frame(
+  sigma = KB$sd,
+  mean  = KB$stats[, "mean"],
+  p10   = KB$stats[, "p10"],
+  p90   = KB$stats[, "p90"]
+)
+
+p_kn <- ggplot(ST, aes(x = sigma, y = mean)) +
+  geom_ribbon(aes(ymin = p10, ymax = p90), alpha = 0.20) +
+  geom_line(size = 0.9) +
+  geom_point(size = 1.6) +
+  scale_x_continuous(breaks = KB$sd, limits = range(KB$sd)) +
+  scale_y_continuous(limits = c(0, 1)) +
+  labs(
+    x = expression(sigma ~ "(Base noise, SD)"),
+    y = "Neighbour overlap (mean Jaccard)",
+    title = "k-NN stability across k \u2208 [10, 20] (mean with p10–p90)"
+  ) +
+  theme_pub(12)
+
+artefacts$FIG_knn_stability_vs_noise <- save_plot(
+  "FIG_knn_stability_vs_noise.png", p_kn, 130, 95, cfg
+)
 
 # 10) Lift map (optional) ------------------------------------------------------
 if (isTRUE(cfg$make_lift_maps)) {
